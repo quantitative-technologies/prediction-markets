@@ -82,16 +82,84 @@ class ArbitrageOpportunity:
     block_number: Optional[int] = None  # Block where opportunity was detected (None = aggregated)
 
 
-def get_alchemy_url() -> str:
-    """Get Alchemy API URL from environment."""
+# RPC provider presets with their block limits for eth_getLogs
+# Note: For historical arbitrage detection, we need archive data.
+# Many free providers only keep recent blocks (pruned nodes).
+RPC_PRESETS = {
+    "drpc": {
+        "url": "https://polygon.drpc.org",
+        "block_limit": 3500,
+        "description": "dRPC (RECOMMENDED: free, archive data, 40-250 RPS)",
+    },
+    "1rpc": {
+        "url": "https://1rpc.io/matic",
+        "block_limit": 3500,
+        "description": "1RPC (free, privacy-oriented)",
+    },
+    "polygon-rpc": {
+        "url": "https://polygon-rpc.com",
+        "block_limit": 50,  # Very restrictive for eth_getLogs
+        "description": "Polygon aggregator (strict eth_getLogs limits)",
+    },
+    "publicnode": {
+        "url": "https://polygon-bor-rpc.publicnode.com",
+        "block_limit": 3500,
+        "description": "PublicNode (NO archive data - recent blocks only)",
+    },
+    "alchemy-free": {
+        "url": None,  # Requires API key
+        "block_limit": 10,
+        "description": "Alchemy free tier (10 blocks/request, archive data)",
+    },
+    "alchemy-payg": {
+        "url": None,  # Requires API key
+        "block_limit": 2000,
+        "description": "Alchemy PAYG (2000 blocks/request, archive data)",
+    },
+}
+
+
+def get_rpc_url(preset: Optional[str] = None, custom_url: Optional[str] = None) -> tuple[str, int]:
+    """
+    Get RPC URL and block limit.
+
+    Returns:
+        Tuple of (rpc_url, block_limit)
+    """
+    # Custom URL takes precedence
+    if custom_url:
+        return custom_url, 3500  # Conservative default for unknown providers
+
+    # Use preset if specified
+    if preset:
+        if preset not in RPC_PRESETS:
+            available = ", ".join(RPC_PRESETS.keys())
+            raise ValueError(f"Unknown preset '{preset}'. Available: {available}")
+
+        config = RPC_PRESETS[preset]
+
+        # Alchemy presets require API key
+        if preset.startswith("alchemy"):
+            api_key = os.environ.get("ALCHEMY_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    f"ALCHEMY_API_KEY environment variable not set for preset '{preset}'.\n"
+                    "Get a free key at https://www.alchemy.com/ and run:\n"
+                    "  export ALCHEMY_API_KEY=your_key_here"
+                )
+            return f"https://polygon-mainnet.g.alchemy.com/v2/{api_key}", config["block_limit"]
+
+        return config["url"], config["block_limit"]
+
+    # Default: try Alchemy if key exists, otherwise use dRPC
     api_key = os.environ.get("ALCHEMY_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "ALCHEMY_API_KEY environment variable not set.\n"
-            "Get a free key at https://www.alchemy.com/ and run:\n"
-            "  export ALCHEMY_API_KEY=your_key_here"
-        )
-    return f"https://polygon-mainnet.g.alchemy.com/v2/{api_key}"
+    if api_key:
+        print("Using Alchemy (ALCHEMY_API_KEY found). For faster fetching, try --rpc-preset drpc")
+        return f"https://polygon-mainnet.g.alchemy.com/v2/{api_key}", 10  # Free tier limit
+
+    # Default to dRPC (best free option with archive data)
+    print("No ALCHEMY_API_KEY found. Using dRPC (free, archive data)")
+    return RPC_PRESETS["drpc"]["url"], RPC_PRESETS["drpc"]["block_limit"]
 
 
 def fetch_market_by_token_id(
@@ -206,7 +274,7 @@ def fetch_markets_for_tokens(
     return token_to_market, dict(error_counts)
 
 
-def get_block_for_timestamp(alchemy_url: str, target_ts: int) -> int:
+def get_block_for_timestamp(rpc_url: str, target_ts: int) -> int:
     """Get block number for a Unix timestamp using binary search."""
 
     def get_block_timestamp(block_num: int) -> Optional[int]:
@@ -216,17 +284,29 @@ def get_block_for_timestamp(alchemy_url: str, target_ts: int) -> int:
             "params": [hex(block_num), False],
             "id": 1
         }
-        resp = requests.post(alchemy_url, json=payload)
-        result = resp.json().get("result")
-        if result:
-            return int(result["timestamp"], 16)
+        try:
+            resp = requests.post(rpc_url, json=payload, timeout=10)
+            data = resp.json()
+            if "error" in data:
+                return None
+            result = data.get("result")
+            if result:
+                return int(result["timestamp"], 16)
+        except Exception:
+            pass
         return None
 
     # Get current block as upper bound
     payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
-    resp = requests.post(alchemy_url, json=payload)
-    current_block = int(resp.json()["result"], 16)
+    resp = requests.post(rpc_url, json=payload, timeout=10)
+    data = resp.json()
+    if "error" in data:
+        raise ValueError(f"Failed to get current block: {data['error']}")
+    current_block = int(data["result"], 16)
     current_ts = get_block_timestamp(current_block)
+
+    if current_ts is None:
+        raise ValueError("Failed to get current block timestamp")
 
     # Quick estimate for starting point
     seconds_diff = current_ts - target_ts
@@ -253,17 +333,19 @@ def get_block_for_timestamp(alchemy_url: str, target_ts: int) -> int:
 
 
 def fetch_order_filled_events(
-    alchemy_url: str,
+    rpc_url: str,
     from_block: int,
     to_block: int,
     contract_address: str = CTF_EXCHANGE,
-    block_chunk: int = 2000,
+    block_chunk: int = 3500,
 ) -> list[dict]:
-    """Fetch OrderFilled events from Alchemy."""
+    """Fetch OrderFilled events from RPC provider."""
     all_logs = []
     total_blocks = to_block - from_block
+    start_time = time.time()
 
     current_from = from_block
+    requests_made = 0
     while current_from <= to_block:
         current_to = min(current_from + block_chunk - 1, to_block)
 
@@ -279,31 +361,61 @@ def fetch_order_filled_events(
             "id": 1
         }
 
-        resp = requests.post(alchemy_url, json=payload)
+        resp = requests.post(rpc_url, json=payload, timeout=30)
         result = resp.json()
+        requests_made += 1
 
         if "error" in result:
             error = result["error"]
-            # Handle Free tier limit (10 blocks)
-            if "Free tier" in str(error.get("message", "")):
-                if block_chunk > 10:
-                    print(f"  Free tier detected, reducing to 10 blocks/request...")
+            error_msg = str(error.get("message", ""))
+
+            # Handle block range limits - try smaller chunks
+            if any(x in error_msg.lower() for x in ["block range", "too large", "exceed", "limit"]):
+                new_chunk = block_chunk // 2
+                if new_chunk >= 10:
+                    print(f"  Block range too large, reducing to {new_chunk} blocks/request...")
                     return fetch_order_filled_events(
-                        alchemy_url, from_block, to_block, contract_address, block_chunk=10
+                        rpc_url, from_block, to_block, contract_address, block_chunk=new_chunk
                     )
+                else:
+                    print(f"  Error: Block range limit too restrictive: {error}")
+                    break
+
+            # Handle Alchemy Free tier limit (10 blocks)
+            if "Free tier" in error_msg:
+                if block_chunk > 10:
+                    print(f"  Alchemy free tier detected, reducing to 10 blocks/request...")
+                    return fetch_order_filled_events(
+                        rpc_url, from_block, to_block, contract_address, block_chunk=10
+                    )
+
             print(f"  Error fetching logs: {error}")
             break
 
         logs = result.get("result", [])
         all_logs.extend(logs)
 
-        # Progress indicator for slow free-tier fetching
+        # Progress indicator
         progress = (current_from - from_block) / total_blocks * 100
-        if block_chunk <= 10 and int(progress) % 10 == 0 and progress > 0:
-            print(f"    Progress: {progress:.0f}% ({len(all_logs)} events so far)")
+        elapsed = time.time() - start_time
+        blocks_done = current_from - from_block
+        rate = blocks_done / elapsed if elapsed > 0 else 0
+        eta = (total_blocks - blocks_done) / rate if rate > 0 else 0
+
+        # Show progress every 5% or every 10 requests for slow fetching
+        show_progress = (int(progress) % 5 == 0 and progress > 0) or (block_chunk <= 10 and requests_made % 10 == 0)
+        if show_progress:
+            print(f"    {progress:.0f}% | {len(all_logs)} events | {rate:.0f} blocks/s | ETA: {eta:.0f}s")
 
         current_from = current_to + 1
-        time.sleep(0.05 if block_chunk > 10 else 0.02)  # Rate limiting
+
+        # Rate limiting - be gentle with free providers
+        if block_chunk > 100:
+            time.sleep(0.1)  # 10 RPS for large chunks
+        elif block_chunk > 10:
+            time.sleep(0.05)  # 20 RPS for medium chunks
+        else:
+            time.sleep(0.02)  # 50 RPS for small chunks (Alchemy free)
 
     return all_logs
 
@@ -499,6 +611,84 @@ def find_arbitrage_at_block(
     return None
 
 
+# Forward-carry window: 5000 blocks (~2.5 hours at 2s/block)
+FORWARD_CARRY_BLOCKS = 5000
+
+
+def get_price_at_block_with_forward_carry(
+    trades: list[Trade],
+    block: int,
+) -> Optional[float]:
+    """
+    Get price at a block using forward-carry mechanism per paper Section 6.1.
+
+    Uses the most recent trade price within FORWARD_CARRY_BLOCKS.
+    Returns None if no valid price exists.
+    """
+    # Find trades at or before this block, within forward-carry window
+    min_block = block - FORWARD_CARRY_BLOCKS
+    valid_trades = [t for t in trades if min_block <= t.block_number <= block]
+
+    if not valid_trades:
+        return None
+
+    # Use the most recent trade's price
+    most_recent = max(valid_trades, key=lambda t: t.block_number)
+    return most_recent.price
+
+
+def find_arbitrage_with_forward_carry(
+    yes_trades: list[Trade],
+    no_trades: list[Trade],
+    from_block: int,
+    to_block: int,
+    profit_threshold: float,
+) -> Optional[dict]:
+    """
+    Find arbitrage opportunities using forward-carry mechanism per paper Section 6.1.
+
+    Checks all blocks where either side had a trade, using forward-carry for the other side.
+    Returns the best opportunity found, or None.
+    """
+    # Get all blocks where trades occurred
+    all_trade_blocks = sorted(set(
+        t.block_number for t in yes_trades + no_trades
+        if from_block <= t.block_number <= to_block
+    ))
+
+    if not all_trade_blocks:
+        return None
+
+    best_result = None
+    best_profit = profit_threshold
+
+    for block in all_trade_blocks:
+        yes_price = get_price_at_block_with_forward_carry(yes_trades, block)
+        no_price = get_price_at_block_with_forward_carry(no_trades, block)
+
+        if yes_price is None or no_price is None:
+            continue
+
+        # Paper's filter: neither exceeds 0.95
+        if yes_price > 0.95 or no_price > 0.95:
+            continue
+
+        combined = yes_price + no_price
+        profit = 1.0 - combined
+
+        if profit > best_profit:
+            best_profit = profit
+            best_result = {
+                "block": block,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "combined": combined,
+                "profit": profit,
+            }
+
+    return best_result
+
+
 def extract_traded_token_ids(events: list[dict]) -> list[str]:
     """Extract unique token IDs from OrderFilled events."""
     token_ids = set()
@@ -522,12 +712,14 @@ def extract_traded_token_ids(events: list[dict]) -> list[str]:
 
 def find_arbitrage_for_day(
     date: datetime,
-    alchemy_url: str,
+    rpc_url: str,
     profit_threshold: float = PROFIT_THRESHOLD,
     hours: int = 24,
     max_tokens: Optional[int] = None,
     market_type: str = "both",
     vwap_blocks: Optional[int] = None,  # None = "all", integer = T blocks
+    use_forward_carry: bool = False,  # Use paper's forward-carry methodology
+    block_chunk: int = 3500,  # Block range per eth_getLogs request
 ) -> list[ArbitrageOpportunity]:
     """
     Find arbitrage opportunities for a given day using on-chain data.
@@ -558,8 +750,8 @@ def find_arbitrage_for_day(
     day_end = day_start + timedelta(hours=hours)
 
     print(f"Getting block range for {day_start.strftime('%Y-%m-%d')}...")
-    from_block = get_block_for_timestamp(alchemy_url, int(day_start.timestamp()))
-    to_block = get_block_for_timestamp(alchemy_url, int(day_end.timestamp()))
+    from_block = get_block_for_timestamp(rpc_url, int(day_start.timestamp()))
+    to_block = get_block_for_timestamp(rpc_url, int(day_end.timestamp()))
     print(f"Block range: {from_block} to {to_block} ({to_block - from_block} blocks)")
 
     # Step 1: Fetch OrderFilled events based on market type selection
@@ -567,13 +759,13 @@ def find_arbitrage_for_day(
 
     if market_type in ("single", "both"):
         print("\nFetching OrderFilled events from CTF Exchange (single-condition markets)...")
-        ctf_events = fetch_order_filled_events(alchemy_url, from_block, to_block, CTF_EXCHANGE)
+        ctf_events = fetch_order_filled_events(rpc_url, from_block, to_block, CTF_EXCHANGE, block_chunk)
         print(f"  Found {len(ctf_events)} events")
         all_events.extend(ctf_events)
 
     if market_type in ("negrisk", "both"):
         print("\nFetching OrderFilled events from NegRisk CTF Exchange (multi-condition markets)...")
-        neg_risk_events = fetch_order_filled_events(alchemy_url, from_block, to_block, NEG_RISK_CTF_EXCHANGE)
+        neg_risk_events = fetch_order_filled_events(rpc_url, from_block, to_block, NEG_RISK_CTF_EXCHANGE, block_chunk)
         print(f"  Found {len(neg_risk_events)} events")
         all_events.extend(neg_risk_events)
 
@@ -600,7 +792,9 @@ def find_arbitrage_for_day(
 
     # Step 4: Calculate VWAP and find arbitrage
     total_blocks = to_block - from_block
-    if vwap_blocks is None:
+    if use_forward_carry:
+        print(f"\nAnalyzing markets for arbitrage (forward-carry, {FORWARD_CARRY_BLOCKS} blocks)...")
+    elif vwap_blocks is None:
         print(f"\nAnalyzing markets for arbitrage (VWAP over all {total_blocks} blocks)...")
     else:
         print(f"\nAnalyzing markets for arbitrage (VWAP window = {vwap_blocks} blocks)...")
@@ -615,6 +809,31 @@ def find_arbitrage_for_day(
         yes_trades = parse_trades_for_token(all_events, market.yes_token_id)
         no_trades = parse_trades_for_token(all_events, market.no_token_id)
 
+        # Forward-carry mode only requires at least one trade on each side somewhere
+        if use_forward_carry:
+            if not yes_trades and not no_trades:
+                continue
+
+            result = find_arbitrage_with_forward_carry(
+                yes_trades, no_trades, from_block, to_block, profit_threshold
+            )
+            if result:
+                opportunities.append(ArbitrageOpportunity(
+                    condition_id=market.condition_id,
+                    question=market.question,
+                    yes_vwap=result["yes_price"],
+                    no_vwap=result["no_price"],
+                    combined_price=result["combined"],
+                    profit_per_dollar=result["profit"],
+                    yes_trade_count=len(yes_trades),
+                    no_trade_count=len(no_trades),
+                    yes_volume=sum(t.token_amount for t in yes_trades),
+                    no_volume=sum(t.token_amount for t in no_trades),
+                    block_number=result["block"],
+                ))
+            continue
+
+        # Non-forward-carry modes require trades on both sides
         if not yes_trades or not no_trades:
             continue
 
@@ -731,7 +950,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--date",
         type=str,
-        required=True,
         help="Date to analyze (YYYY-MM-DD)"
     )
     parser.add_argument(
@@ -774,8 +992,57 @@ if __name__ == "__main__":
             "or integer T = sliding window of T blocks"
         )
     )
+    parser.add_argument(
+        "--forward-carry",
+        action="store_true",
+        help=(
+            "Use forward-carry mechanism per Section 6.1: "
+            "carry last known price up to 5000 blocks (~2.5h). "
+            "This is the paper's primary methodology."
+        )
+    )
+    parser.add_argument(
+        "--rpc-preset",
+        type=str,
+        choices=list(RPC_PRESETS.keys()),
+        default=None,
+        help=(
+            "RPC provider preset. Options: "
+            "polygon-rpc (free, recommended), publicnode (free), "
+            "ankr (free), drpc (free), 1rpc (free), "
+            "alchemy-free (10 blocks/req), alchemy-payg (2000 blocks/req). "
+            "Default: polygon-rpc.com if no ALCHEMY_API_KEY, else alchemy-free."
+        )
+    )
+    parser.add_argument(
+        "--rpc-url",
+        type=str,
+        default=None,
+        help="Custom RPC URL (overrides --rpc-preset)"
+    )
+    parser.add_argument(
+        "--list-rpc",
+        action="store_true",
+        help="List available RPC presets and exit"
+    )
 
     args = parser.parse_args()
+
+    # Handle --list-rpc
+    if args.list_rpc:
+        print("Available RPC presets:\n")
+        for name, config in RPC_PRESETS.items():
+            print(f"  {name:15} - {config['description']}")
+            print(f"                    Block limit: {config['block_limit']}")
+            if config['url']:
+                print(f"                    URL: {config['url']}")
+            print()
+        exit(0)
+
+    # Validate required arguments
+    if not args.date:
+        print("Error: --date is required (use YYYY-MM-DD format)")
+        exit(1)
 
     # Parse vwap_blocks argument
     if args.vwap_blocks.lower() == "all":
@@ -790,9 +1057,9 @@ if __name__ == "__main__":
             print(f"Error: --vwap-blocks must be a positive integer or 'all', got '{args.vwap_blocks}'")
             exit(1)
 
-    # Validate Alchemy API key
+    # Get RPC URL and block limit
     try:
-        alchemy_url = get_alchemy_url()
+        rpc_url, block_limit = get_rpc_url(preset=args.rpc_preset, custom_url=args.rpc_url)
     except ValueError as e:
         print(f"Error: {e}")
         exit(1)
@@ -810,19 +1077,25 @@ if __name__ == "__main__":
     print(f"Polymarket Arbitrage Detector")
     print(f"Date: {target_date.strftime('%Y-%m-%d')}")
     print(f"Market type: {market_type_labels[args.market_type]}")
-    print(f"VWAP window: {vwap_label}")
+    if args.forward_carry:
+        print(f"Price method: forward-carry (5000 blocks)")
+    else:
+        print(f"VWAP window: {vwap_label}")
     print(f"Profit threshold: ${args.threshold:.2f} per $1 invested")
+    print(f"RPC: {rpc_url[:50]}{'...' if len(rpc_url) > 50 else ''} (block limit: {block_limit})")
     print()
 
     # Find arbitrage (markets are now looked up by traded token IDs)
     opportunities = find_arbitrage_for_day(
         date=target_date,
-        alchemy_url=alchemy_url,
+        rpc_url=rpc_url,
         profit_threshold=args.threshold,
         hours=args.hours,
         max_tokens=args.max_tokens,
         market_type=args.market_type,
         vwap_blocks=vwap_blocks,
+        use_forward_carry=args.forward_carry,
+        block_chunk=block_limit,
     )
 
     print_opportunities(opportunities, target_date)

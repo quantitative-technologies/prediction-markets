@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "pandas>=2.3.3",
+    "py-clob-client>=0.34.5",
     "python-dotenv>=1.2.1",
     "requests>=2.32.5",
+    "web3>=7.14.0",
 ]
