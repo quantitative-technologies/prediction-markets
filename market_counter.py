@@ -1,9 +1,17 @@
+"""
+Count single-condition markets using py-clob-client only.
+
+Per paper Section 4.1: "We retrieved market metadata directly from the
+Polymarket API using the official Python client [24]."
+[24] references py-clob-client.
+
+No Gamma API usage - all data comes from CLOB.
+"""
 import json
 import os
 import sys
 import time
 
-import requests
 from py_clob_client.client import ClobClient
 from datetime import datetime
 
@@ -12,13 +20,10 @@ client = ClobClient("https://clob.polymarket.com")
 START_DATE = datetime(2024, 4, 1)
 END_DATE = datetime(2025, 4, 1)
 
-GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-ESTIMATED_GAMMA = 50000
 ESTIMATED_CLOB = 350000
 
 CACHE_DIR = "cache"
 CLOB_CACHE = os.path.join(CACHE_DIR, "clob_markets.json")
-GAMMA_CACHE = os.path.join(CACHE_DIR, "gamma_closing_dates.json")
 RESULTS_FILE = "single_condition_markets.json"
 
 
@@ -40,59 +45,6 @@ def draw_progress_bar(current, total, start_time, label=""):
         f"{rate:,.0f}/s | ETA: {eta:.0f}s"
     )
     sys.stdout.flush()
-
-
-def load_or_fetch_closing_dates():
-    """Load closing dates from cache or fetch from Gamma API."""
-    if os.path.exists(GAMMA_CACHE):
-        print(f"Loading from cache: {GAMMA_CACHE}")
-        with open(GAMMA_CACHE) as f:
-            return json.load(f)
-
-    closing_dates = {}
-    offset = 0
-    limit = 500
-    start_time = time.time()
-
-    while True:
-        response = requests.get(
-            GAMMA_API_URL,
-            params={
-                "closed": "true",
-                "limit": limit,
-                "offset": offset,
-                "end_date_min": "2024-01-01",
-                "end_date_max": "2025-07-01",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        markets = response.json()
-
-        if not markets:
-            break
-
-        for m in markets:
-            closed_time = m.get('closedTime')
-            if closed_time:
-                closing_dates[m['conditionId']] = closed_time
-
-        offset += len(markets)
-        draw_progress_bar(offset, ESTIMATED_GAMMA, start_time, "Gamma")
-
-        if len(markets) < limit:
-            break
-
-        time.sleep(0.05)
-
-    sys.stdout.write("\n")
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(GAMMA_CACHE, "w") as f:
-        json.dump(closing_dates, f)
-    print(f"Saved to cache: {GAMMA_CACHE}")
-
-    return closing_dates
 
 
 def load_or_fetch_clob_markets():
@@ -127,58 +79,87 @@ def load_or_fetch_clob_markets():
     return all_markets
 
 
-def filter_single_condition_markets(markets, closing_dates):
-    """Filter and return single-condition markets resolved within the date range."""
+def parse_end_date(m):
+    """Parse end_date_iso from market, handling timezone."""
+    end_date_str = m.get('end_date_iso')
+    if not end_date_str:
+        return None
+
+    try:
+        # Handle ISO format with Z suffix
+        if end_date_str.endswith('Z'):
+            end_date_str = end_date_str[:-1]
+        # Parse datetime (ignore timezone for comparison)
+        return datetime.fromisoformat(end_date_str.split('+')[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def filter_single_condition_markets(markets):
+    """Filter single-condition markets with end_date within study period.
+
+    Uses end_date_iso from CLOB data (no Gamma API).
+    """
     results = []
-    missing = 0
+    no_end_date = 0
+    outside_range = 0
 
     for m in markets:
+        # Single-condition = neg_risk is False
         if m['neg_risk']:
             continue
 
-        assert len(m['tokens']) == 2
-
-        condition_id = m['condition_id']
-        if condition_id not in closing_dates:
-            missing += 1
+        # Must have exactly 2 tokens (binary market)
+        if len(m['tokens']) != 2:
             continue
 
-        closed_time_str = closing_dates[condition_id]
-        closed_time = datetime.strptime(closed_time_str[:19], "%Y-%m-%d %H:%M:%S")
-
-        if not (START_DATE <= closed_time <= END_DATE):
+        # Parse end date from CLOB data
+        end_date = parse_end_date(m)
+        if end_date is None:
+            no_end_date += 1
             continue
 
-        # Combine CLOB market data with closing time from Gamma
+        # Filter by study period
+        if not (START_DATE <= end_date <= END_DATE):
+            outside_range += 1
+            continue
+
         result = {
-            "condition_id": condition_id,
+            "condition_id": m['condition_id'],
             "question": m['question'],
-            "closed_time": closed_time_str,
             "end_date_iso": m['end_date_iso'],
             "tokens": m['tokens'],
             "market_slug": m['market_slug'],
         }
         results.append(result)
 
-    print(f"  (missing closing dates: {missing})")
+    print(f"  Filtered out: {no_end_date} (no end date), {outside_range} (outside study period)")
     return results
 
 
 if __name__ == "__main__":
-    print("Loading closing dates...")
-    closing_dates = load_or_fetch_closing_dates()
-    print(f"Closing dates: {len(closing_dates)}")
+    print("=" * 60)
+    print("SINGLE-CONDITION MARKET COUNTER")
+    print("Using py-clob-client only (no Gamma API)")
+    print("=" * 60)
+    print(f"Study period: {START_DATE.date()} to {END_DATE.date()}")
+    print()
 
-    print("\nLoading CLOB markets...")
+    print("Loading CLOB markets...")
     markets = load_or_fetch_clob_markets()
-    print(f"CLOB markets: {len(markets)}")
+    print(f"Total CLOB markets: {len(markets):,}")
 
     print("\nFiltering single-condition markets...")
-    results = filter_single_condition_markets(markets, closing_dates)
+    results = filter_single_condition_markets(markets)
 
     with open(RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved {len(results)} markets to {RESULTS_FILE}")
+    print(f"\nSaved {len(results):,} markets to {RESULTS_FILE}")
 
-    print(f"\nSingle-condition markets resolved Apr 2024 - Apr 2025: {len(results)}")
-    print(f"Paper reference: 8659")
+    print()
+    print("=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    print(f"Single-condition markets (end_date in study period): {len(results):,}")
+    print(f"Paper Section 4.1 reference: 8,659")
+    print()
