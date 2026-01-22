@@ -104,29 +104,12 @@ def decode_order_filled_event(log: dict) -> Optional[dict]:
         return None
 
 
-def extract_token_ids(events: list[dict]) -> set[str]:
-    """Extract unique token IDs from events."""
-    token_ids = set()
+def build_trades_index(events: list[dict]) -> dict[str, list[Trade]]:
+    """Build token_id -> trades index in a single pass through events.
 
-    for log in events:
-        decoded = decode_order_filled_event(log)
-        if not decoded:
-            continue
-
-        maker = decoded["maker_asset_id"]
-        taker = decoded["taker_asset_id"]
-
-        if maker != "0":
-            token_ids.add(maker)
-        if taker != "0":
-            token_ids.add(taker)
-
-    return token_ids
-
-
-def parse_trades_for_token(events: list[dict], token_id: str) -> list[Trade]:
-    """Parse OrderFilled events into trades for a specific token."""
-    trades = []
+    This is O(events) instead of O(tokens × events) for the old approach.
+    """
+    trades_by_token: dict[str, list[Trade]] = {}
 
     for log in events:
         decoded = decode_order_filled_event(log)
@@ -137,31 +120,40 @@ def parse_trades_for_token(events: list[dict], token_id: str) -> list[Trade]:
         taker_asset = decoded["taker_asset_id"]
         maker_amount = decoded["maker_amount"]
         taker_amount = decoded["taker_amount"]
+        block_number = decoded["block_number"]
+        tx_hash = decoded["tx_hash"]
 
-        if maker_asset == token_id and taker_asset == "0":
-            # BUY
+        # BUY: maker_asset is the token, taker_asset is USDC (0)
+        if maker_asset != "0" and taker_asset == "0":
+            token_id = maker_asset
             token_amount = maker_amount / 1e6
             usdc_amount = taker_amount / 1e6
             if token_amount > 0:
                 price = usdc_amount / token_amount
-                trades.append(Trade(
-                    block_number=decoded["block_number"],
-                    tx_hash=decoded["tx_hash"],
+                if token_id not in trades_by_token:
+                    trades_by_token[token_id] = []
+                trades_by_token[token_id].append(Trade(
+                    block_number=block_number,
+                    tx_hash=tx_hash,
                     token_id=token_id,
                     side="buy",
                     token_amount=token_amount,
                     usdc_amount=usdc_amount,
                     price=price,
                 ))
-        elif taker_asset == token_id and maker_asset == "0":
-            # SELL
+
+        # SELL: taker_asset is the token, maker_asset is USDC (0)
+        if taker_asset != "0" and maker_asset == "0":
+            token_id = taker_asset
             token_amount = taker_amount / 1e6
             usdc_amount = maker_amount / 1e6
             if token_amount > 0:
                 price = usdc_amount / token_amount
-                trades.append(Trade(
-                    block_number=decoded["block_number"],
-                    tx_hash=decoded["tx_hash"],
+                if token_id not in trades_by_token:
+                    trades_by_token[token_id] = []
+                trades_by_token[token_id].append(Trade(
+                    block_number=block_number,
+                    tx_hash=tx_hash,
                     token_id=token_id,
                     side="sell",
                     token_amount=token_amount,
@@ -169,7 +161,7 @@ def parse_trades_for_token(events: list[dict], token_id: str) -> list[Trade]:
                     price=price,
                 ))
 
-    return trades
+    return trades_by_token
 
 
 def get_price_at_block_with_forward_carry(trades: list[Trade], block: int) -> Optional[float]:
@@ -303,10 +295,8 @@ def analyze_date(
     if not events:
         return []
 
-    # Extract token IDs
-    token_ids = list(extract_token_ids(events))
-    if max_tokens:
-        token_ids = token_ids[:max_tokens]
+    # Build trades index in single pass - O(events) instead of O(tokens × events)
+    trades_by_token = build_trades_index(events)
 
     # Get block range
     blocks = [int(e["blockNumber"], 16) for e in events if "blockNumber" in e]
@@ -317,7 +307,7 @@ def analyze_date(
 
     # Look up markets from pre-loaded CLOB cache
     markets = {}
-    for token_id in token_ids:
+    for token_id in trades_by_token.keys():
         market = get_market_by_token_id(token_id)
         if market:
             cid = market["condition_id"]
@@ -329,12 +319,12 @@ def analyze_date(
                     continue
                 markets[cid] = market
 
-    # Find arbitrage
+    # Find arbitrage - O(1) lookup per market now
     opportunities = []
 
     for condition_id, market in markets.items():
-        yes_trades = parse_trades_for_token(events, market["yes_token_id"])
-        no_trades = parse_trades_for_token(events, market["no_token_id"])
+        yes_trades = trades_by_token.get(market["yes_token_id"], [])
+        no_trades = trades_by_token.get(market["no_token_id"], [])
 
         if not yes_trades and not no_trades:
             continue
