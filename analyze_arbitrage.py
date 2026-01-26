@@ -3,6 +3,9 @@ Analyze arbitrage opportunities using cached blockchain events.
 
 This script reads locally cached OrderFilled events and detects arbitrage
 without needing to re-fetch from RPC providers.
+
+Methodology follows Section 6 of arXiv:2508.03474.
+See docs/arbitrage_methodology.md for mathematical formulation.
 """
 
 import json
@@ -14,6 +17,8 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 from collections import defaultdict
 
+import polars as pl
+
 # Cache directories
 CACHE_DIR = "cache"
 EVENTS_CACHE_DIR = os.path.join(CACHE_DIR, "events")
@@ -24,11 +29,11 @@ RESULTS_DIR = os.path.join(CACHE_DIR, "arbitrage_results")
 # CLOB markets cache (from py-clob-client via market_counter.py)
 CLOB_MARKETS_PATH = os.path.join(CACHE_DIR, "clob_markets.json")
 
-# Paper's threshold: $0.05 minimum profit per $1 invested
-PROFIT_THRESHOLD = 0.05
-
-# Forward-carry window: 5000 blocks (~2.5 hours at 2s/block)
-FORWARD_CARRY_BLOCKS = 5000
+# Default parameters (Section 6 of paper)
+DEFAULT_VWAP_WINDOW = 1          # T: VWAP window size in blocks
+DEFAULT_FORWARD_CARRY = 5000     # W: Forward-carry lookback window (~2.5 hours)
+DEFAULT_ARBITRAGE_THRESHOLD = 0.02  # θ: Arbitrage threshold (2%)
+DEFAULT_VWAP_MAX = 0.95          # Maximum VWAP for any position
 
 # Study period
 START_DATE = datetime(2024, 4, 1)
@@ -52,9 +57,9 @@ class ArbitrageOpportunity:
     """Detected arbitrage opportunity."""
     condition_id: str
     question: str
-    yes_price: float
-    no_price: float
-    combined_price: float
+    yes_vwap: float
+    no_vwap: float
+    combined_vwap: float
     profit_per_dollar: float
     yes_trade_count: int
     no_trade_count: int
@@ -164,16 +169,54 @@ def build_trades_index(events: list[dict]) -> dict[str, list[Trade]]:
     return trades_by_token
 
 
-def get_price_at_block_with_forward_carry(trades: list[Trade], block: int) -> Optional[float]:
-    """Get price at block using forward-carry."""
-    min_block = block - FORWARD_CARRY_BLOCKS
-    valid_trades = [t for t in trades if min_block <= t.block_number <= block]
+def compute_vwap(trades: list[Trade], block: int, window: int) -> Optional[float]:
+    """Compute VWAP for trades within the window [block - window + 1, block].
+
+    VWAP = sum(usdc_amount) / sum(token_amount)
+    """
+    window_trades = [t for t in trades if block - window + 1 <= t.block_number <= block]
+
+    if not window_trades:
+        return None
+
+    total_usdc = sum(t.usdc_amount for t in window_trades)
+    total_tokens = sum(t.token_amount for t in window_trades)
+
+    if total_tokens == 0:
+        return None
+
+    return total_usdc / total_tokens
+
+
+def get_vwap_with_forward_carry(
+    trades: list[Trade],
+    block: int,
+    vwap_window: int,
+    forward_carry: int
+) -> Optional[float]:
+    """Get VWAP at block, with forward-carry if no trades in current window.
+
+    1. Try to compute VWAP from trades in [block - vwap_window + 1, block]
+    2. If no trades, find most recent block with trades (within forward_carry limit)
+    3. Return VWAP from that block's window, or None if no trades within lookback
+    """
+    # First try current window
+    vwap = compute_vwap(trades, block, vwap_window)
+    if vwap is not None:
+        return vwap
+
+    # Forward-carry: find most recent block with trades
+    min_block = block - forward_carry
+    valid_trades = [t for t in trades if min_block <= t.block_number < block]
 
     if not valid_trades:
         return None
 
-    most_recent = max(valid_trades, key=lambda t: t.block_number)
-    return most_recent.price
+    # Get most recent block with trades
+    most_recent_block = max(t.block_number for t in valid_trades)
+
+    # Compute VWAP at that block
+    return compute_vwap(trades, most_recent_block, vwap_window)
 
 
 def find_arbitrage_for_market(
@@ -181,9 +224,16 @@ def find_arbitrage_for_market(
     no_trades: list[Trade],
     from_block: int,
     to_block: int,
-    profit_threshold: float,
+    arbitrage_threshold: float,
+    vwap_window: int,
+    forward_carry: int,
+    vwap_max: float,
 ) -> Optional[dict]:
-    """Find best arbitrage opportunity for a market."""
+    """Find best arbitrage opportunity for a market using VWAP.
+
+    Arbitrage exists when |1 - (VWAP_Y + VWAP_N)| > arbitrage_threshold.
+    Only considers blocks where both VWAPs are <= vwap_max.
+    """
     all_trade_blocks = sorted(set(
         t.block_number for t in yes_trades + no_trades
         if from_block <= t.block_number <= to_block
@@ -193,32 +243,85 @@ def find_arbitrage_for_market(
         return None
 
     best_result = None
-    best_profit = profit_threshold
+    best_profit = arbitrage_threshold
 
     for block in all_trade_blocks:
-        yes_price = get_price_at_block_with_forward_carry(yes_trades, block)
-        no_price = get_price_at_block_with_forward_carry(no_trades, block)
+        yes_vwap = get_vwap_with_forward_carry(yes_trades, block, vwap_window, forward_carry)
+        no_vwap = get_vwap_with_forward_carry(no_trades, block, vwap_window, forward_carry)
 
-        if yes_price is None or no_price is None:
+        if yes_vwap is None or no_vwap is None:
             continue
 
-        if yes_price > 0.95 or no_price > 0.95:
+        # Price filter: skip if any position VWAP > vwap_max
+        if yes_vwap > vwap_max or no_vwap > vwap_max:
             continue
 
-        combined = yes_price + no_price
-        profit = 1.0 - combined
+        combined = yes_vwap + no_vwap
+        deviation = abs(1.0 - combined)
 
-        if profit > best_profit:
-            best_profit = profit
+        # Arbitrage condition: |1 - VWAP_sum| > threshold
+        if deviation > best_profit:
+            # Profit is positive for long arbitrage (combined < 1)
+            profit = 1.0 - combined
+            best_profit = deviation
             best_result = {
                 "block": block,
-                "yes_price": yes_price,
-                "no_price": no_price,
+                "yes_vwap": yes_vwap,
+                "no_vwap": no_vwap,
                 "combined": combined,
                 "profit": profit,
             }
 
     return best_result
+
+
+def collect_vwap_observations(
+    yes_trades: list[Trade],
+    no_trades: list[Trade],
+    from_block: int,
+    to_block: int,
+    vwap_window: int,
+    forward_carry: int,
+    vwap_max: float,
+) -> list[dict]:
+    """Collect all VWAP observations for a market.
+
+    Returns a list of observations at each block where we have trades,
+    with the VWAP pair values (using forward-carry for stale prices).
+    """
+    all_trade_blocks = sorted(set(
+        t.block_number for t in yes_trades + no_trades
+        if from_block <= t.block_number <= to_block
+    ))
+
+    if not all_trade_blocks:
+        return []
+
+    observations = []
+
+    for block in all_trade_blocks:
+        yes_vwap = get_vwap_with_forward_carry(yes_trades, block, vwap_window, forward_carry)
+        no_vwap = get_vwap_with_forward_carry(no_trades, block, vwap_window, forward_carry)
+
+        if yes_vwap is None or no_vwap is None:
+            continue
+
+        # Apply price filter
+        if yes_vwap > vwap_max or no_vwap > vwap_max:
+            continue
+
+        combined = yes_vwap + no_vwap
+        deviation = abs(1.0 - combined)
+
+        observations.append({
+            "block": block,
+            "yes_vwap": yes_vwap,
+            "no_vwap": no_vwap,
+            "combined": combined,
+            "deviation": deviation,
+        })
+
+    return observations
 
 
 # Token ID -> market lookup (built from CLOB cache)
@@ -272,28 +375,37 @@ def get_market_by_token_id(token_id: str) -> Optional[dict]:
 def analyze_date(
     date: datetime,
     market_type: str = "single",
-    profit_threshold: float = PROFIT_THRESHOLD,
-    max_tokens: int | None = None,
-) -> list[ArbitrageOpportunity]:
-    """Analyze a single date for arbitrage opportunities."""
+    arbitrage_threshold: float = DEFAULT_ARBITRAGE_THRESHOLD,
+    vwap_window: int = DEFAULT_VWAP_WINDOW,
+    forward_carry: int = DEFAULT_FORWARD_CARRY,
+    vwap_max: float = DEFAULT_VWAP_MAX,
+    collect_observations: bool = False,
+) -> tuple[list[ArbitrageOpportunity], list[dict]]:
+    """Analyze a single date for arbitrage opportunities.
+
+    Returns:
+        tuple: (opportunities, observations)
+            - opportunities: list of ArbitrageOpportunity for markets with arbitrage
+            - observations: list of all VWAP observations (if collect_observations=True)
+    """
     date_str = date.strftime("%Y-%m-%d")
 
     # Load events based on market type
     if market_type == "single":
         events = load_events_for_date(date, "ctf")
         if events is None:
-            return []
+            return [], []
     elif market_type == "negrisk":
         events = load_events_for_date(date, "negrisk")
         if events is None:
-            return []
+            return [], []
     else:  # both
         ctf_events = load_events_for_date(date, "ctf") or []
         negrisk_events = load_events_for_date(date, "negrisk") or []
         events = ctf_events + negrisk_events
 
     if not events:
-        return []
+        return [], []
 
     # Build trades index in single pass - O(events) instead of O(tokens × events)
     trades_by_token = build_trades_index(events)
@@ -301,7 +413,7 @@ def analyze_date(
     # Get block range
     blocks = [int(e["blockNumber"], 16) for e in events if "blockNumber" in e]
     if not blocks:
-        return []
+        return [], []
     from_block = min(blocks)
     to_block = max(blocks)
 
@@ -321,6 +433,7 @@ def analyze_date(
 
     # Find arbitrage - O(1) lookup per market now
     opportunities = []
+    all_observations = []
 
     for condition_id, market in markets.items():
         yes_trades = trades_by_token.get(market["yes_token_id"], [])
@@ -329,17 +442,35 @@ def analyze_date(
         if not yes_trades and not no_trades:
             continue
 
+        # Collect all VWAP observations if requested
+        if collect_observations:
+            obs = collect_vwap_observations(
+                yes_trades, no_trades, from_block, to_block,
+                vwap_window, forward_carry, vwap_max
+            )
+            for o in obs:
+                all_observations.append({
+                    "condition_id": condition_id,
+                    "date": date_str,
+                    "block": o["block"],
+                    "yes_vwap": o["yes_vwap"],
+                    "no_vwap": o["no_vwap"],
+                    "combined": o["combined"],
+                    "deviation": o["deviation"],
+                })
+
         result = find_arbitrage_for_market(
-            yes_trades, no_trades, from_block, to_block, profit_threshold
+            yes_trades, no_trades, from_block, to_block,
+            arbitrage_threshold, vwap_window, forward_carry, vwap_max
         )
 
         if result:
             opportunities.append(ArbitrageOpportunity(
                 condition_id=condition_id,
                 question=market["question"],
-                yes_price=result["yes_price"],
-                no_price=result["no_price"],
-                combined_price=result["combined"],
+                yes_vwap=result["yes_vwap"],
+                no_vwap=result["no_vwap"],
+                combined_vwap=result["combined"],
                 profit_per_dollar=result["profit"],
                 yes_trade_count=len(yes_trades),
                 no_trade_count=len(no_trades),
@@ -347,7 +478,7 @@ def analyze_date(
                 date=date_str,
             ))
 
-    return opportunities
+    return opportunities, all_observations
 
 
 def get_cached_dates(exchange: str) -> list[datetime]:
@@ -369,10 +500,21 @@ def get_cached_dates(exchange: str) -> list[datetime]:
 
 def run_analysis(
     market_type: str = "single",
-    profit_threshold: float = PROFIT_THRESHOLD,
-    max_tokens: int | None = None,
+    arbitrage_threshold: float = DEFAULT_ARBITRAGE_THRESHOLD,
+    vwap_window: int = DEFAULT_VWAP_WINDOW,
+    forward_carry: int = DEFAULT_FORWARD_CARRY,
+    vwap_max: float = DEFAULT_VWAP_MAX,
+    save_parquet: bool = False,
 ) -> dict:
-    """Run full analysis on all cached data."""
+    """Run full analysis on all cached data.
+
+    Parameters match Section 6 of the paper:
+    - arbitrage_threshold (θ): Minimum deviation for arbitrage (default 0.02 = 2%)
+    - vwap_window (T): VWAP window size in blocks (default 1)
+    - forward_carry (W): Forward-carry lookback in blocks (default 5000 ~2.5 hours)
+    - vwap_max: Maximum VWAP for any position (default 0.95)
+    - save_parquet: Save all VWAP observations to Parquet for analysis
+    """
     load_clob_markets()
 
     # Get available dates
@@ -386,10 +528,15 @@ def run_analysis(
         available_dates = sorted(ctf_dates | negrisk_dates)
 
     print(f"\n{'='*60}")
-    print("ARBITRAGE ANALYSIS")
+    print("ARBITRAGE ANALYSIS (Section 6 Methodology)")
     print(f"{'='*60}")
     print(f"Market type: {market_type}")
-    print(f"Profit threshold: {profit_threshold:.0%}")
+    print(f"Parameters:")
+    print(f"  Arbitrage threshold (θ): {arbitrage_threshold:.0%}")
+    print(f"  VWAP window (T): {vwap_window} blocks")
+    print(f"  Forward-carry (W): {forward_carry} blocks")
+    print(f"  VWAP max: {vwap_max}")
+    print(f"  Save Parquet: {save_parquet}")
     print(f"Available dates: {len(available_dates)}")
     print()
 
@@ -399,6 +546,8 @@ def run_analysis(
 
     # Analyze each date
     all_conditions = {}
+    all_observations = []
+    condition_metadata = {}  # condition_id -> {question, ...}
     daily_stats = []
     start_time = time.time()
 
@@ -406,7 +555,14 @@ def run_analysis(
         date_str = date.strftime("%Y-%m-%d")
         print(f"[{i+1}/{len(available_dates)}] {date_str}...")
 
-        opportunities = analyze_date(date, market_type, profit_threshold, max_tokens)
+        opportunities, observations = analyze_date(
+            date, market_type,
+            arbitrage_threshold, vwap_window, forward_carry, vwap_max,
+            collect_observations=save_parquet
+        )
+
+        if save_parquet:
+            all_observations.extend(observations)
 
         daily_stats.append({
             "date": date_str,
@@ -417,13 +573,20 @@ def run_analysis(
             cid = opp.condition_id
             if cid not in all_conditions or opp.profit_per_dollar > all_conditions[cid].profit_per_dollar:
                 all_conditions[cid] = opp
+            # Track metadata for Parquet output
+            if save_parquet and cid not in condition_metadata:
+                condition_metadata[cid] = {
+                    "condition_id": cid,
+                    "question": opp.question,
+                }
 
         elapsed = time.time() - start_time
         rate = (i + 1) / elapsed if elapsed > 0 else 0
         remaining = len(available_dates) - i - 1
         eta = remaining / rate if rate > 0 else 0
 
-        print(f"  Found {len(opportunities)} opportunities | Total unique: {len(all_conditions)} | ETA: {eta/60:.1f} min")
+        obs_info = f" | Observations: {len(all_observations):,}" if save_parquet else ""
+        print(f"  Found {len(opportunities)} opportunities | Total unique: {len(all_conditions)}{obs_info} | ETA: {eta/60:.1f} min")
 
     # Final results
     print(f"\n{'='*60}")
@@ -458,7 +621,12 @@ def run_analysis(
 
     results = {
         "market_type": market_type,
-        "profit_threshold": profit_threshold,
+        "parameters": {
+            "arbitrage_threshold": arbitrage_threshold,
+            "vwap_window": vwap_window,
+            "forward_carry": forward_carry,
+            "vwap_max": vwap_max,
+        },
         "days_analyzed": len(available_dates),
         "unique_conditions": len(all_conditions),
         "daily_stats": daily_stats,
@@ -469,30 +637,85 @@ def run_analysis(
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {results_path}")
 
+    # Save Parquet files if requested
+    if save_parquet and all_observations:
+        print(f"\n{'='*60}")
+        print("SAVING PARQUET FILES")
+        print(f"{'='*60}")
+
+        # Observations parquet
+        obs_path = os.path.join(RESULTS_DIR, f"observations_{market_type}.parquet")
+        obs_df = pl.DataFrame(all_observations)
+        obs_df.write_parquet(obs_path)
+        print(f"Observations: {len(all_observations):,} rows -> {obs_path}")
+
+        # Conditions metadata parquet
+        cond_path = os.path.join(RESULTS_DIR, f"conditions_{market_type}.parquet")
+        cond_df = pl.DataFrame(list(condition_metadata.values()))
+        cond_df.write_parquet(cond_path)
+        print(f"Conditions: {len(condition_metadata):,} rows -> {cond_path}")
+
+        # Summary statistics per condition
+        summary_df = obs_df.group_by("condition_id").agg([
+            pl.col("deviation").max().alias("max_deviation"),
+            pl.col("deviation").mean().alias("mean_deviation"),
+            pl.col("combined").min().alias("min_combined"),
+            pl.col("combined").max().alias("max_combined"),
+            pl.col("combined").mean().alias("mean_combined"),
+            pl.len().alias("observation_count"),
+            pl.col("block").min().alias("first_block"),
+            pl.col("block").max().alias("last_block"),
+            (pl.col("deviation") > arbitrage_threshold).sum().alias("arbitrage_blocks"),
+        ]).sort("max_deviation", descending=True)
+
+        summary_path = os.path.join(RESULTS_DIR, f"summary_{market_type}.parquet")
+        summary_df.write_parquet(summary_path)
+        print(f"Summary: {len(summary_df):,} conditions -> {summary_path}")
+
     return results
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Analyze arbitrage from cached events")
+    parser = argparse.ArgumentParser(
+        description="Analyze arbitrage from cached events (Section 6 methodology)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--market-type",
         choices=["single", "negrisk", "both"],
         default="single",
-        help="Market type to analyze (default: single)"
+        help="Market type to analyze"
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=PROFIT_THRESHOLD,
-        help=f"Minimum profit threshold (default: {PROFIT_THRESHOLD})"
+        default=DEFAULT_ARBITRAGE_THRESHOLD,
+        help="Arbitrage threshold θ (minimum |1 - VWAP_sum| for arbitrage)"
     )
     parser.add_argument(
-        "--max-tokens",
+        "--vwap-window",
         type=int,
-        default=None,
-        help="Max tokens to look up per day (for testing)"
+        default=DEFAULT_VWAP_WINDOW,
+        help="VWAP window size T in blocks"
+    )
+    parser.add_argument(
+        "--forward-carry",
+        type=int,
+        default=DEFAULT_FORWARD_CARRY,
+        help="Forward-carry lookback W in blocks (~2.5 hours at default)"
+    )
+    parser.add_argument(
+        "--vwap-max",
+        type=float,
+        default=DEFAULT_VWAP_MAX,
+        help="Maximum VWAP for any position (price filter)"
+    )
+    parser.add_argument(
+        "--parquet",
+        action="store_true",
+        help="Save all VWAP observations to Parquet files for analysis"
     )
     parser.add_argument(
         "--status",
@@ -522,6 +745,9 @@ if __name__ == "__main__":
 
     run_analysis(
         market_type=args.market_type,
-        profit_threshold=args.threshold,
-        max_tokens=args.max_tokens,
+        arbitrage_threshold=args.threshold,
+        vwap_window=args.vwap_window,
+        forward_carry=args.forward_carry,
+        vwap_max=args.vwap_max,
+        save_parquet=args.parquet,
     )
