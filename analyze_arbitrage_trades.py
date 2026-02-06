@@ -117,10 +117,17 @@ def decode_order_filled_event(log: dict) -> Optional[dict]:
         return None
 
 
+# Exchange contract addresses to filter out
+CTF_EXCHANGE = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+NEG_RISK_CTF_EXCHANGE = "0xc5d563a36ae78145c45a50134d48a1215220f80a"
+EXCHANGE_CONTRACTS = {CTF_EXCHANGE.lower(), NEG_RISK_CTF_EXCHANGE.lower()}
+
+
 def build_user_trades_index(events: list[dict]) -> dict[str, list[UserTrade]]:
     """Build user_address -> trades index.
 
-    We track the taker as the "user" since they initiate the trade.
+    We track the MAKER as the "user" since the taker is often the exchange
+    contract matching orders. Exchange contracts are filtered out.
     """
     trades_by_user: dict[str, list[UserTrade]] = defaultdict(list)
 
@@ -135,39 +142,47 @@ def build_user_trades_index(events: list[dict]) -> dict[str, list[UserTrade]]:
         taker_amount = decoded["taker_amount"]
         block_number = decoded["block_number"]
         tx_hash = decoded["tx_hash"]
-        taker_address = decoded["taker_address"]
+        maker_address = decoded["maker_address"]
 
-        # BUY: taker pays USDC (asset 0), receives tokens
-        if taker_asset == "0" and maker_asset != "0":
+        # Skip if maker is an exchange contract
+        if maker_address.lower() in EXCHANGE_CONTRACTS:
+            continue
+
+        # BUY: maker provides tokens, receives USDC
+        # (maker_asset is the token, taker_asset is USDC)
+        if maker_asset != "0" and taker_asset == "0":
             token_id = maker_asset
             token_amount = maker_amount / 1e6
             usdc_amount = taker_amount / 1e6
             if token_amount > 0 and usdc_amount >= MIN_TRADE_VALUE:
                 price = usdc_amount / token_amount
-                trades_by_user[taker_address].append(UserTrade(
+                # From maker's perspective: they SOLD tokens
+                trades_by_user[maker_address].append(UserTrade(
                     block_number=block_number,
                     tx_hash=tx_hash,
-                    user_address=taker_address,
+                    user_address=maker_address,
                     token_id=token_id,
-                    side="buy",
+                    side="sell",
                     token_amount=token_amount,
                     usdc_amount=usdc_amount,
                     price=price,
                 ))
 
-        # SELL: taker provides tokens, receives USDC
-        if taker_asset != "0" and maker_asset == "0":
+        # SELL: maker provides USDC, receives tokens
+        # (maker_asset is USDC, taker_asset is the token)
+        if maker_asset == "0" and taker_asset != "0":
             token_id = taker_asset
             token_amount = taker_amount / 1e6
             usdc_amount = maker_amount / 1e6
             if token_amount > 0 and usdc_amount >= MIN_TRADE_VALUE:
                 price = usdc_amount / token_amount
-                trades_by_user[taker_address].append(UserTrade(
+                # From maker's perspective: they BOUGHT tokens
+                trades_by_user[maker_address].append(UserTrade(
                     block_number=block_number,
                     tx_hash=tx_hash,
-                    user_address=taker_address,
+                    user_address=maker_address,
                     token_id=token_id,
-                    side="sell",
+                    side="buy",
                     token_amount=token_amount,
                     usdc_amount=usdc_amount,
                     price=price,
