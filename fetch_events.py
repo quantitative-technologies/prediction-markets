@@ -1,16 +1,20 @@
 """
-Fetch and cache OrderFilled events from Polygon blockchain.
+Fetch and cache blockchain events from Polygon.
 
 This script downloads raw blockchain events once and caches them locally,
 enabling fast repeated analysis without re-fetching from RPC providers.
 
+Supported event types:
+  - OrderFilled from CTF Exchange and NegRisk CTF Exchange
+  - PositionSplit and PositionsMerge from the Conditional Token contract
+
 Data structure:
-    cache/events/{exchange}/{YYYY-MM-DD}.json
+    cache/events/{source}/{YYYY-MM-DD}.json
 
 Each file contains:
     {
         "date": "2024-04-01",
-        "exchange": "ctf" or "negrisk",
+        "exchange": "ctf" | "negrisk" | "ct",
         "from_block": 55304250,
         "to_block": 55340808,
         "events": [...raw event logs...]
@@ -23,13 +27,22 @@ import sys
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Ensure unbuffered output for background execution
+sys.stdout.reconfigure(line_buffering=True)
 
 # Polymarket contracts on Polygon
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+CONDITIONAL_TOKEN = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# OrderFilled event signature
+# Event signatures
 ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+POSITION_SPLIT_TOPIC = "0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298"
+POSITIONS_MERGE_TOPIC = "0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca"
 
 # Study period from the paper
 START_DATE = datetime(2024, 4, 1)
@@ -40,12 +53,27 @@ CACHE_DIR = "cache"
 EVENTS_CACHE_DIR = os.path.join(CACHE_DIR, "events")
 CTF_CACHE_DIR = os.path.join(EVENTS_CACHE_DIR, "ctf")
 NEGRISK_CACHE_DIR = os.path.join(EVENTS_CACHE_DIR, "negrisk")
+CT_CACHE_DIR = os.path.join(EVENTS_CACHE_DIR, "ct")
+
+# Source configs: (contract_address, [event_topics])
+SOURCE_CONFIGS = {
+    "ctf": (CTF_EXCHANGE, [ORDER_FILLED_TOPIC]),
+    "negrisk": (NEG_RISK_CTF_EXCHANGE, [ORDER_FILLED_TOPIC]),
+    "ct": (CONDITIONAL_TOKEN, [POSITION_SPLIT_TOPIC, POSITIONS_MERGE_TOPIC]),
+}
+
+CACHE_DIRS = {
+    "ctf": CTF_CACHE_DIR,
+    "negrisk": NEGRISK_CACHE_DIR,
+    "ct": CT_CACHE_DIR,
+}
 
 # RPC configuration
 RPC_PRESETS = {
     "drpc": ("https://polygon.drpc.org", 3500),
     "alchemy": (None, 2000),  # Needs ALCHEMY_API_KEY
 }
+RPC_TIMEOUT = 120  # seconds per eth_getLogs request
 
 
 def get_rpc_url(preset: str = "drpc") -> tuple[str, int]:
@@ -123,9 +151,13 @@ def fetch_events_for_range(
     from_block: int,
     to_block: int,
     contract_address: str,
+    event_topic: str,
     block_chunk: int = 3500,
-) -> list[dict]:
-    """Fetch OrderFilled events for a block range."""
+) -> list[dict] | None:
+    """Fetch events matching a single topic for a block range.
+
+    Returns None on failure (partial data is discarded).
+    """
     all_logs = []
     total_blocks = to_block - from_block
     start_time = time.time()
@@ -139,15 +171,19 @@ def fetch_events_for_range(
             "method": "eth_getLogs",
             "params": [{
                 "address": contract_address,
-                "topics": [ORDER_FILLED_TOPIC],
+                "topics": [event_topic],
                 "fromBlock": hex(current_from),
                 "toBlock": hex(current_to),
             }],
             "id": 1
         }
 
-        resp = requests.post(rpc_url, json=payload, timeout=30)
-        result = resp.json()
+        try:
+            resp = requests.post(rpc_url, json=payload, timeout=RPC_TIMEOUT)
+            result = resp.json()
+        except Exception as e:
+            print(f"    FETCH ERROR: {e}")
+            return None
 
         if "error" in result:
             error = result["error"]
@@ -159,14 +195,15 @@ def fetch_events_for_range(
                 if new_chunk >= 10:
                     print(f"  Reducing chunk size to {new_chunk}...")
                     return fetch_events_for_range(
-                        rpc_url, from_block, to_block, contract_address, new_chunk
+                        rpc_url, from_block, to_block, contract_address,
+                        event_topic, new_chunk,
                     )
                 else:
-                    print(f"  ERROR: Block range too restrictive: {error}")
-                    break
+                    print(f"    ERROR: Block range too restrictive: {error}")
+                    return None
 
-            print(f"  ERROR: {error}")
-            break
+            print(f"    ERROR: {error}")
+            return None
 
         logs = result.get("result", [])
         all_logs.extend(logs)
@@ -187,8 +224,8 @@ def fetch_events_for_range(
 
 
 def get_cache_path(date: datetime, exchange: str) -> str:
-    """Get cache file path for a date and exchange."""
-    cache_dir = CTF_CACHE_DIR if exchange == "ctf" else NEGRISK_CACHE_DIR
+    """Get cache file path for a date and source."""
+    cache_dir = CACHE_DIRS[exchange]
     return os.path.join(cache_dir, f"{date.strftime('%Y-%m-%d')}.json")
 
 
@@ -208,7 +245,7 @@ def load_cached_events(date: datetime, exchange: str) -> dict | None:
 
 def save_events(date: datetime, exchange: str, from_block: int, to_block: int, events: list) -> None:
     """Save events to cache."""
-    cache_dir = CTF_CACHE_DIR if exchange == "ctf" else NEGRISK_CACHE_DIR
+    cache_dir = CACHE_DIRS[exchange]
     os.makedirs(cache_dir, exist_ok=True)
 
     data = {
@@ -229,13 +266,26 @@ def fetch_day(
     date: datetime,
     rpc_url: str,
     block_limit: int,
-    exchanges: list[str] = ["ctf", "negrisk"],
+    sources: list[str] = ["ctf", "negrisk"],
     use_cache: bool = True,
 ) -> dict:
     """Fetch events for a single day."""
     results = {}
 
-    # Get block range for this day
+    # Check if all sources are cached — skip block range lookup entirely
+    if use_cache and all(is_cached(date, s) for s in sources):
+        for source in sources:
+            cached = load_cached_events(date, source)
+            results[source] = {
+                "from_block": cached["from_block"],
+                "to_block": cached["to_block"],
+                "event_count": cached["event_count"],
+                "cached": True,
+            }
+            print(f"  {source.upper()}: {cached['event_count']} events [cached]")
+        return results
+
+    # Get block range for this day (only needed for uncached sources)
     day_start = datetime(date.year, date.month, date.day, tzinfo=timezone.utc)
     day_end = day_start + timedelta(days=1)
 
@@ -244,63 +294,79 @@ def fetch_day(
 
     print(f"  Block range: {from_block} to {to_block} ({to_block - from_block} blocks)")
 
-    for exchange in exchanges:
+    for source in sources:
         # Check cache first
-        if use_cache and is_cached(date, exchange):
-            cached = load_cached_events(date, exchange)
-            results[exchange] = {
+        if use_cache and is_cached(date, source):
+            cached = load_cached_events(date, source)
+            results[source] = {
                 "from_block": cached["from_block"],
                 "to_block": cached["to_block"],
                 "event_count": cached["event_count"],
                 "cached": True,
             }
-            print(f"  {exchange.upper()}: {cached['event_count']} events [cached]")
+            print(f"  {source.upper()}: {cached['event_count']} events [cached]")
             continue
 
         # Fetch from blockchain
-        contract = CTF_EXCHANGE if exchange == "ctf" else NEG_RISK_CTF_EXCHANGE
-        print(f"  {exchange.upper()}: Fetching...")
+        contract, event_topics = SOURCE_CONFIGS[source]
+        print(f"  {source.upper()}: Fetching...")
 
-        events = fetch_events_for_range(rpc_url, from_block, to_block, contract, block_limit)
+        # Fetch each event topic and combine
+        all_events = []
+        fetch_failed = False
+        for topic in event_topics:
+            events = fetch_events_for_range(
+                rpc_url, from_block, to_block, contract, topic, block_limit,
+            )
+            if events is None:
+                fetch_failed = True
+                break
+            all_events.extend(events)
+
+        if fetch_failed:
+            print(f"  {source.upper()}: SKIPPED (fetch failed, not caching partial data)")
+            continue
+
+        # Sort combined events by block number
+        all_events.sort(key=lambda e: int(e.get("blockNumber", "0x0"), 16))
 
         # Save to cache
-        save_events(date, exchange, from_block, to_block, events)
+        save_events(date, source, from_block, to_block, all_events)
 
-        results[exchange] = {
+        results[source] = {
             "from_block": from_block,
             "to_block": to_block,
-            "event_count": len(events),
+            "event_count": len(all_events),
             "cached": False,
         }
-        print(f"  {exchange.upper()}: {len(events)} events [fetched]")
+        print(f"  {source.upper()}: {len(all_events)} events [fetched]")
 
     return results
 
 
 def get_cache_status() -> dict:
     """Get status of cached data."""
-    status = {"ctf": [], "negrisk": []}
+    all_sources = list(SOURCE_CONFIGS.keys())
+    status = {s: [] for s in all_sources}
 
-    for exchange in ["ctf", "negrisk"]:
+    for source in all_sources:
         current = START_DATE
         while current < END_DATE:
-            if is_cached(current, exchange):
-                status[exchange].append(current.strftime("%Y-%m-%d"))
+            if is_cached(current, source):
+                status[source].append(current.strftime("%Y-%m-%d"))
             current += timedelta(days=1)
 
     total_days = (END_DATE - START_DATE).days
-    return {
-        "total_days": total_days,
-        "ctf_cached": len(status["ctf"]),
-        "negrisk_cached": len(status["negrisk"]),
-        "ctf_dates": status["ctf"],
-        "negrisk_dates": status["negrisk"],
-    }
+    result = {"total_days": total_days}
+    for source in all_sources:
+        result[f"{source}_cached"] = len(status[source])
+        result[f"{source}_dates"] = status[source]
+    return result
 
 
 def run_fetch(
     rpc_preset: str = "drpc",
-    exchanges: list[str] = ["ctf", "negrisk"],
+    sources: list[str] = ["ctf", "negrisk"],
     use_cache: bool = True,
     start_from: datetime | None = None,
 ) -> None:
@@ -315,8 +381,9 @@ def run_fetch(
     print(f"{'='*60}")
     print(f"Study period: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
     print(f"Total days: {total_days}")
-    print(f"CTF cached: {status['ctf_cached']} days")
-    print(f"NegRisk cached: {status['negrisk_cached']} days")
+    for source in sources:
+        cached = status.get(f"{source}_cached", 0)
+        print(f"{source.upper()} cached: {cached} days")
     print(f"RPC: {rpc_url}")
     print(f"Block limit: {block_limit}")
     print()
@@ -324,7 +391,7 @@ def run_fetch(
     current = start_from or START_DATE
     day_num = (current - START_DATE).days
     start_time = time.time()
-    total_events = {"ctf": 0, "negrisk": 0}
+    total_events = {s: 0 for s in sources}
 
     while current < END_DATE:
         day_num += 1
@@ -333,10 +400,10 @@ def run_fetch(
         print(f"\n[{day_num}/{total_days}] {date_str}")
 
         try:
-            results = fetch_day(current, rpc_url, block_limit, exchanges, use_cache)
+            results = fetch_day(current, rpc_url, block_limit, sources, use_cache)
 
-            for exchange, data in results.items():
-                total_events[exchange] += data["event_count"]
+            for source, data in results.items():
+                total_events[source] += data["event_count"]
 
             # Progress
             elapsed = time.time() - start_time
@@ -354,45 +421,47 @@ def run_fetch(
     print(f"\n{'='*60}")
     print("FETCH COMPLETE")
     print(f"{'='*60}")
-    print(f"Total CTF events: {total_events['ctf']:,}")
-    print(f"Total NegRisk events: {total_events['negrisk']:,}")
+    for source in sources:
+        print(f"Total {source.upper()} events: {total_events[source]:,}")
     print(f"Total events: {sum(total_events.values()):,}")
 
     # Calculate storage size
-    ctf_size = sum(
-        os.path.getsize(os.path.join(CTF_CACHE_DIR, f))
-        for f in os.listdir(CTF_CACHE_DIR)
-        if f.endswith(".json")
-    ) if os.path.exists(CTF_CACHE_DIR) else 0
-
-    negrisk_size = sum(
-        os.path.getsize(os.path.join(NEGRISK_CACHE_DIR, f))
-        for f in os.listdir(NEGRISK_CACHE_DIR)
-        if f.endswith(".json")
-    ) if os.path.exists(NEGRISK_CACHE_DIR) else 0
-
-    print(f"Cache size: {(ctf_size + negrisk_size) / 1024 / 1024:.1f} MB")
+    total_size = 0
+    for source in sources:
+        cache_dir = CACHE_DIRS[source]
+        if os.path.exists(cache_dir):
+            size = sum(
+                os.path.getsize(os.path.join(cache_dir, f))
+                for f in os.listdir(cache_dir)
+                if f.endswith(".json")
+            )
+            total_size += size
+    print(f"Cache size: {total_size / 1024 / 1024:.1f} MB")
 
 
 if __name__ == "__main__":
     import argparse
 
+    all_sources = list(SOURCE_CONFIGS.keys())
+
     parser = argparse.ArgumentParser(
-        description="Fetch and cache OrderFilled events from Polygon"
+        description="Fetch and cache blockchain events from Polygon",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--rpc-preset",
         type=str,
         choices=list(RPC_PRESETS.keys()),
         default="drpc",
-        help="RPC provider preset (default: drpc)"
+        help="RPC provider preset"
     )
     parser.add_argument(
-        "--exchange",
+        "--source",
         type=str,
-        choices=["ctf", "negrisk", "both"],
-        default="both",
-        help="Which exchange to fetch (default: both)"
+        choices=all_sources + ["orders", "all"],
+        default="orders",
+        help="Event source to fetch: ctf, negrisk, ct (split/merge), "
+             "orders (ctf+negrisk), or all"
     )
     parser.add_argument(
         "--no-cache",
@@ -417,19 +486,32 @@ if __name__ == "__main__":
         status = get_cache_status()
         print(f"Cache status:")
         print(f"  Total days in study period: {status['total_days']}")
-        print(f"  CTF Exchange: {status['ctf_cached']}/{status['total_days']} days cached")
-        print(f"  NegRisk Exchange: {status['negrisk_cached']}/{status['total_days']} days cached")
+        for source in all_sources:
+            cached = status.get(f"{source}_cached", 0)
+            label = {"ctf": "CTF Exchange", "negrisk": "NegRisk Exchange",
+                     "ct": "Conditional Token (split/merge)"}[source]
+            print(f"  {label}: {cached}/{status['total_days']} days cached")
 
-        if os.path.exists(CTF_CACHE_DIR):
-            ctf_size = sum(os.path.getsize(os.path.join(CTF_CACHE_DIR, f)) for f in os.listdir(CTF_CACHE_DIR))
-            print(f"  CTF cache size: {ctf_size / 1024 / 1024:.1f} MB")
-        if os.path.exists(NEGRISK_CACHE_DIR):
-            negrisk_size = sum(os.path.getsize(os.path.join(NEGRISK_CACHE_DIR, f)) for f in os.listdir(NEGRISK_CACHE_DIR))
-            print(f"  NegRisk cache size: {negrisk_size / 1024 / 1024:.1f} MB")
+        for source in all_sources:
+            cache_dir = CACHE_DIRS[source]
+            if os.path.exists(cache_dir):
+                size = sum(
+                    os.path.getsize(os.path.join(cache_dir, f))
+                    for f in os.listdir(cache_dir)
+                    if f.endswith(".json")
+                )
+                print(f"  {source.upper()} cache size: {size / 1024 / 1024:.1f} MB")
 
         sys.exit(0)
 
-    exchanges = ["ctf"] if args.exchange == "ctf" else ["negrisk"] if args.exchange == "negrisk" else ["ctf", "negrisk"]
+    source_map = {
+        "ctf": ["ctf"],
+        "negrisk": ["negrisk"],
+        "ct": ["ct"],
+        "orders": ["ctf", "negrisk"],
+        "all": all_sources,
+    }
+    sources = source_map[args.source]
 
     start_from = None
     if args.start_from:
@@ -437,7 +519,7 @@ if __name__ == "__main__":
 
     run_fetch(
         rpc_preset=args.rpc_preset,
-        exchanges=exchanges,
+        sources=sources,
         use_cache=not args.no_cache,
         start_from=start_from,
     )
