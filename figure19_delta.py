@@ -185,16 +185,45 @@ def main():
     print(f"  25th:   {np.percentile(median_deltas_arr, 25):,.1f} blocks")
     print(f"  75th:   {np.percentile(median_deltas_arr, 75):,.1f} blocks")
 
-    # Create boxplot
+    # Create boxplot matching paper's Figure 19 style
+    #
+    # Boxplot elements:
+    #   Box:      Interquartile range (IQR) -- 25th to 75th percentile
+    #   Line:     Median (50th percentile)
+    #   Whiskers: Extend to furthest data point within 1.5 * IQR from box edges
+    #   Circles:  Outliers (extreme values beyond the whiskers)
+    #
     fig, ax = plt.subplots(figsize=(6, 6))
 
+    # With millions of data points, plotting every outlier is impractical.
+    # Draw the boxplot without fliers, then manually add a subsampled set.
     bp = ax.boxplot(
         [all_deltas_arr, median_deltas_arr],
-        labels=["Global", "Median Global"],
+        tick_labels=["Global", "Median Global"],
         showfliers=False,
         patch_artist=True,
         medianprops=dict(color="black", linewidth=1.5),
+        whiskerprops=dict(color="black", linewidth=1),
+        capprops=dict(color="black", linewidth=1),
     )
+
+    # Manually plot subsampled outliers as black circles
+    max_outliers = 500
+    for i, data in enumerate([all_deltas_arr, median_deltas_arr]):
+        q1, q3 = np.percentile(data, [25, 75])
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outliers = data[(data < lower) | (data > upper)]
+        if len(outliers) > max_outliers:
+            outliers = np.random.default_rng(42).choice(
+                outliers, max_outliers, replace=False
+            )
+        ax.scatter(
+            np.full(len(outliers), i + 1),
+            outliers,
+            marker="o", s=6, c="black", alpha=0.4, zorder=3,
+        )
 
     bp["boxes"][0].set_facecolor("#4C72B0")
     bp["boxes"][1].set_facecolor("#DD8452")
@@ -207,6 +236,13 @@ def main():
     plt.tight_layout()
     plt.savefig("figure19_delta.png", dpi=150)
     print("\nSaved figure19_delta.png")
+
+    # Print boxplot element guide
+    print("\nBoxplot elements:")
+    print("  Box:      IQR (25th to 75th percentile)")
+    print("  Line:     Median (50th percentile)")
+    print("  Whiskers: Furthest point within 1.5 * IQR from box edges")
+    print("  Circles:  Outliers (extreme values beyond whiskers)")
 
 
 if __name__ == "__main__":
