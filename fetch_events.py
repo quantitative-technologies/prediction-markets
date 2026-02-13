@@ -157,6 +157,7 @@ def fetch_events_for_range(
     """Fetch events matching a single topic for a block range.
 
     Returns None on failure (partial data is discarded).
+    Retries individual chunks with smaller sizes and backoff on errors.
     """
     all_logs = []
     total_blocks = to_block - from_block
@@ -164,49 +165,67 @@ def fetch_events_for_range(
 
     current_from = from_block
     while current_from <= to_block:
-        current_to = min(current_from + block_chunk - 1, to_block)
+        chunk = block_chunk
+        current_to = min(current_from + chunk - 1, to_block)
+        max_retries = 5
+        success = False
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_getLogs",
-            "params": [{
-                "address": contract_address,
-                "topics": [event_topic],
-                "fromBlock": hex(current_from),
-                "toBlock": hex(current_to),
-            }],
-            "id": 1
-        }
+        for attempt in range(max_retries):
+            current_to = min(current_from + chunk - 1, to_block)
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_getLogs",
+                "params": [{
+                    "address": contract_address,
+                    "topics": [event_topic],
+                    "fromBlock": hex(current_from),
+                    "toBlock": hex(current_to),
+                }],
+                "id": 1
+            }
 
-        try:
-            resp = requests.post(rpc_url, json=payload, timeout=RPC_TIMEOUT)
-            result = resp.json()
-        except Exception as e:
-            print(f"    FETCH ERROR: {e}")
-            return None
+            try:
+                resp = requests.post(rpc_url, json=payload, timeout=RPC_TIMEOUT)
+                result = resp.json()
+            except Exception as e:
+                print(f"    FETCH ERROR (attempt {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"    Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                    continue
+                return None
 
-        if "error" in result:
-            error = result["error"]
-            error_msg = str(error.get("message", ""))
+            if "error" in result:
+                error = result["error"]
+                error_msg = str(error.get("message", ""))
 
-            # Handle block range limits - try smaller chunks
-            if any(x in error_msg.lower() for x in ["block range", "too large", "exceed", "limit"]):
-                new_chunk = block_chunk // 2
-                if new_chunk >= 10:
-                    print(f"  Reducing chunk size to {new_chunk}...")
-                    return fetch_events_for_range(
-                        rpc_url, from_block, to_block, contract_address,
-                        event_topic, new_chunk,
-                    )
+                retriable = any(x in error_msg.lower() for x in [
+                    "block range", "too large", "exceed", "limit",
+                    "timed out", "timeout", "internal error",
+                    "server error", "rate limit", "too many",
+                    "temporary", "please retry",
+                ])
+                if retriable and attempt < max_retries - 1:
+                    new_chunk = chunk // 2
+                    if new_chunk >= 10:
+                        chunk = new_chunk
+                    wait = 2 ** attempt
+                    print(f"    {error_msg} (attempt {attempt+1}), chunk={chunk}, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
                 else:
-                    print(f"    ERROR: Block range too restrictive: {error}")
+                    print(f"    ERROR: {error}")
                     return None
 
-            print(f"    ERROR: {error}")
-            return None
+            # Success
+            logs = result.get("result", [])
+            all_logs.extend(logs)
+            success = True
+            break
 
-        logs = result.get("result", [])
-        all_logs.extend(logs)
+        if not success:
+            return None
 
         # Progress indicator
         progress = (current_from - from_block) / total_blocks * 100
@@ -369,9 +388,12 @@ def run_fetch(
     sources: list[str] = ["ctf", "negrisk"],
     use_cache: bool = True,
     start_from: datetime | None = None,
+    block_chunk_override: int | None = None,
 ) -> None:
     """Fetch events for the full study period."""
     rpc_url, block_limit = get_rpc_url(rpc_preset)
+    if block_chunk_override is not None:
+        block_limit = block_chunk_override
 
     total_days = (END_DATE - START_DATE).days
     status = get_cache_status()
@@ -475,6 +497,12 @@ if __name__ == "__main__":
         help="Start from a specific date (YYYY-MM-DD)"
     )
     parser.add_argument(
+        "--block-chunk",
+        type=int,
+        default=None,
+        help="Override block chunk size (default: from RPC preset)"
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Show cache status and exit"
@@ -522,4 +550,5 @@ if __name__ == "__main__":
         sources=sources,
         use_cache=not args.no_cache,
         start_from=start_from,
+        block_chunk_override=args.block_chunk,
     )
