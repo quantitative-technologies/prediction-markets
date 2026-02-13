@@ -21,9 +21,15 @@ wheels/
 # claude
 .claude/
 
-# data cache
+# macOS
+.DS_Store
+
+# Generated outputs
+*.png
+
+# Data cache
 cache/
 *.json
 
-# logs
+# Logs
 *.log
