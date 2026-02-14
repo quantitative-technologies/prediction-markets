@@ -25,11 +25,17 @@ import matplotlib.pyplot as plt
 # CLOB markets for token -> condition mapping
 CLOB_MARKETS_PATH = "cache/clob_markets.json"
 
+# Cache for computed delta arrays
+DELTA_CACHE_DIR = "cache/deltas"
+
 # Exchange contracts to filter out
 EXCHANGE_CONTRACTS = {
     "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
     "0xc5d563a36ae78145c45a50134d48a1215220f80a",
 }
+
+# Window size from paper (Section 7)
+T_BLOCKS = 950
 
 
 def load_token_to_condition() -> dict[str, str]:
@@ -52,12 +58,15 @@ def load_token_to_condition() -> dict[str, str]:
 def process_events_file(
     filepath: str,
     token_to_condition: dict[str, str],
-    user_condition_blocks: dict[tuple, list],
+    blocks_all: dict[tuple, list],
+    blocks_gt2: dict[tuple, list],
 ):
     """Process a single day's events file.
 
     For each OrderFilled event, record (user, condition, block_number)
-    for the maker address. Filters bids below $2 and exchange contracts.
+    for both maker and taker addresses. Populates two dicts:
+      blocks_all: no dollar filter
+      blocks_gt2: only bids > $2
     """
     with open(filepath) as f:
         data = json.load(f)
@@ -93,63 +102,35 @@ def process_events_file(
         else:
             continue
 
-        # Filter bids below $2
-        if usdc < 2.0:
-            continue
-
         # Get condition_id
         condition_id = token_to_condition.get(token_id)
         if not condition_id:
             continue
 
         block_number = int(log["blockNumber"], 16)
+        gt2 = usdc > 2.0
 
-        # Extract maker address (main user)
+        # Extract maker address
         maker_address = "0x" + topics[2][-40:]
         if maker_address.lower() not in EXCHANGE_CONTRACTS:
             key = (maker_address, condition_id)
-            user_condition_blocks[key].append(block_number)
+            blocks_all[key].append(block_number)
+            if gt2:
+                blocks_gt2[key].append(block_number)
 
-        # Also extract taker address
+        # Extract taker address
         taker_address = "0x" + topics[3][-40:]
         if taker_address.lower() not in EXCHANGE_CONTRACTS:
             key = (taker_address, condition_id)
-            user_condition_blocks[key].append(block_number)
+            blocks_all[key].append(block_number)
+            if gt2:
+                blocks_gt2[key].append(block_number)
 
 
-def main():
-    token_to_condition = load_token_to_condition()
-    sys.stdout.flush()
-
-    # Accumulate block numbers per (user, condition)
-    user_condition_blocks: dict[tuple, list] = defaultdict(list)
-
-    sources = ["ctf", "negrisk"]
-    total_files = 0
-
-    for source in sources:
-        cache_dir = os.path.join("cache", "events", source)
-        files = sorted(glob.glob(os.path.join(cache_dir, "*.json")))
-        print(f"\nProcessing {source}: {len(files)} files", flush=True)
-        start = time.time()
-
-        for i, filepath in enumerate(files):
-            process_events_file(filepath, token_to_condition, user_condition_blocks)
-            total_files += 1
-
-            if (i + 1) % 30 == 0 or i == len(files) - 1:
-                elapsed = time.time() - start
-                rate = (i + 1) / elapsed
-                eta = (len(files) - i - 1) / rate if rate > 0 else 0
-                n_pairs = len(user_condition_blocks)
-                print(f"  [{i+1}/{len(files)}] {n_pairs:,} (user,cond) pairs | "
-                      f"{rate:.1f} files/s | ETA: {eta:.0f}s", flush=True)
-
-    # Compute deltas
-    print(f"\nComputing deltas for {len(user_condition_blocks):,} (user, condition) pairs...")
-
-    all_deltas = []       # Every individual delta
-    median_deltas = []    # Median delta per (user, condition) pair
+def compute_deltas(user_condition_blocks: dict[tuple, list]):
+    """Compute all deltas and per-pair median deltas."""
+    all_deltas = []
+    median_deltas = []
 
     for key, blocks in user_condition_blocks.items():
         if len(blocks) < 2:
@@ -157,7 +138,6 @@ def main():
 
         blocks_sorted = sorted(blocks)
         deltas = np.diff(blocks_sorted)
-        # Filter out zero deltas (same block)
         deltas = deltas[deltas > 0]
 
         if len(deltas) == 0:
@@ -166,39 +146,123 @@ def main():
         all_deltas.append(deltas)
         median_deltas.append(float(np.median(deltas)))
 
-    all_deltas_arr = np.concatenate(all_deltas)
-    median_deltas_arr = np.array(median_deltas)
+    all_arr = np.concatenate(all_deltas) if all_deltas else np.array([])
+    med_arr = np.array(median_deltas)
+    return all_arr, med_arr
 
-    print(f"Total individual deltas: {len(all_deltas_arr):,}")
-    print(f"(User, condition) pairs with deltas: {len(median_deltas_arr):,}")
 
-    # Print statistics
-    print(f"\nGlobal delta stats:")
-    print(f"  Mean:   {np.mean(all_deltas_arr):,.1f} blocks")
-    print(f"  Median: {np.median(all_deltas_arr):,.1f} blocks")
-    print(f"  25th:   {np.percentile(all_deltas_arr, 25):,.1f} blocks")
-    print(f"  75th:   {np.percentile(all_deltas_arr, 75):,.1f} blocks")
+def print_delta_stats(label: str, all_deltas: np.ndarray, median_deltas: np.ndarray):
+    """Print delta statistics including T=950 match rate."""
+    n_total = len(all_deltas)
+    if n_total == 0:
+        print(f"\n{label}: no deltas")
+        return
 
-    print(f"\nMedian Global delta stats:")
-    print(f"  Mean:   {np.mean(median_deltas_arr):,.1f} blocks")
-    print(f"  Median: {np.median(median_deltas_arr):,.1f} blocks")
-    print(f"  25th:   {np.percentile(median_deltas_arr, 25):,.1f} blocks")
-    print(f"  75th:   {np.percentile(median_deltas_arr, 75):,.1f} blocks")
+    within_T = np.sum(all_deltas <= T_BLOCKS)
+    pct_within = within_T / n_total * 100
 
-    # Create boxplot matching paper's Figure 19 style
-    #
+    med_within_T = np.sum(median_deltas <= T_BLOCKS)
+    med_pct = med_within_T / len(median_deltas) * 100 if len(median_deltas) > 0 else 0
+
+    print(f"\n{'=' * 60}")
+    print(f"{label}")
+    print(f"{'=' * 60}")
+    print(f"Total individual deltas:       {n_total:>14,}")
+    print(f"(User, condition) pairs:       {len(median_deltas):>14,}")
+    print(f"")
+    print(f"Global delta stats:")
+    print(f"  Mean:                        {np.mean(all_deltas):>14,.1f} blocks")
+    print(f"  Median:                      {np.median(all_deltas):>14,.1f} blocks")
+    print(f"  25th percentile:             {np.percentile(all_deltas, 25):>14,.1f} blocks")
+    print(f"  75th percentile:             {np.percentile(all_deltas, 75):>14,.1f} blocks")
+    print(f"")
+    print(f"Deltas within T={T_BLOCKS} blocks:")
+    print(f"  Global:  {within_T:>12,} / {n_total:,} ({pct_within:.1f}%)")
+    print(f"  Median:  {med_within_T:>12,} / {len(median_deltas):,} ({med_pct:.1f}%)")
+    print(f"{'=' * 60}")
+
+
+def save_delta_cache(all_deltas: np.ndarray, median_deltas: np.ndarray, suffix: str):
+    """Save computed delta arrays to disk."""
+    os.makedirs(DELTA_CACHE_DIR, exist_ok=True)
+    np.save(os.path.join(DELTA_CACHE_DIR, f"all_deltas_{suffix}.npy"), all_deltas)
+    np.save(os.path.join(DELTA_CACHE_DIR, f"median_deltas_{suffix}.npy"), median_deltas)
+    print(f"Cached {suffix} deltas to {DELTA_CACHE_DIR}/", flush=True)
+
+
+def load_delta_cache(suffix: str):
+    """Load cached delta arrays if available."""
+    all_path = os.path.join(DELTA_CACHE_DIR, f"all_deltas_{suffix}.npy")
+    med_path = os.path.join(DELTA_CACHE_DIR, f"median_deltas_{suffix}.npy")
+    if os.path.exists(all_path) and os.path.exists(med_path):
+        return np.load(all_path), np.load(med_path)
+    return None, None
+
+
+def main():
+    # Try loading from cache first
+    all_deltas_all, med_deltas_all = load_delta_cache("all_bids")
+    all_deltas_gt2, med_deltas_gt2 = load_delta_cache("gt2")
+
+    if all_deltas_all is not None and all_deltas_gt2 is not None:
+        print("Loaded deltas from cache", flush=True)
+    else:
+        print("No cache found, processing events...", flush=True)
+        token_to_condition = load_token_to_condition()
+        sys.stdout.flush()
+
+        blocks_all: dict[tuple, list] = defaultdict(list)
+        blocks_gt2: dict[tuple, list] = defaultdict(list)
+
+        sources = ["ctf", "negrisk"]
+
+        for source in sources:
+            cache_dir = os.path.join("cache", "events", source)
+            files = sorted(glob.glob(os.path.join(cache_dir, "*.json")))
+            print(f"\nProcessing {source}: {len(files)} files", flush=True)
+            start = time.time()
+
+            for i, filepath in enumerate(files):
+                process_events_file(filepath, token_to_condition, blocks_all, blocks_gt2)
+
+                if (i + 1) % 30 == 0 or i == len(files) - 1:
+                    elapsed = time.time() - start
+                    rate = (i + 1) / elapsed
+                    eta = (len(files) - i - 1) / rate if rate > 0 else 0
+                    n_all = len(blocks_all)
+                    n_gt2 = len(blocks_gt2)
+                    print(f"  [{i+1}/{len(files)}] {n_all:,} pairs (all) | "
+                          f"{n_gt2:,} pairs (>$2) | "
+                          f"{rate:.1f} files/s | ETA: {eta:.0f}s", flush=True)
+
+        print(f"\nComputing deltas (all bids)...", flush=True)
+        all_deltas_all, med_deltas_all = compute_deltas(blocks_all)
+        save_delta_cache(all_deltas_all, med_deltas_all, "all_bids")
+
+        del blocks_all  # free memory
+
+        print(f"Computing deltas (bids > $2)...", flush=True)
+        all_deltas_gt2, med_deltas_gt2 = compute_deltas(blocks_gt2)
+        save_delta_cache(all_deltas_gt2, med_deltas_gt2, "gt2")
+
+        del blocks_gt2
+
+    # Print stats for both
+    print_delta_stats("ALL BIDS (no filter)", all_deltas_all, med_deltas_all)
+    print_delta_stats("BIDS > $2 (paper filter)", all_deltas_gt2, med_deltas_gt2)
+
+    # Create boxplot using >$2 data (matching paper)
     # Boxplot elements:
     #   Box:      Interquartile range (IQR) -- 25th to 75th percentile
     #   Line:     Median (50th percentile)
     #   Whiskers: Extend to furthest data point within 1.5 * IQR from box edges
     #   Circles:  Outliers (extreme values beyond the whiskers)
-    #
     fig, ax = plt.subplots(figsize=(6, 6))
 
     # With millions of data points, plotting every outlier is impractical.
     # Draw the boxplot without fliers, then manually add a subsampled set.
     bp = ax.boxplot(
-        [all_deltas_arr, median_deltas_arr],
+        [all_deltas_gt2, med_deltas_gt2],
         tick_labels=["Global", "Median Global"],
         showfliers=False,
         patch_artist=True,
@@ -209,7 +273,7 @@ def main():
 
     # Manually plot subsampled outliers as black circles
     max_outliers = 500
-    for i, data in enumerate([all_deltas_arr, median_deltas_arr]):
+    for i, data in enumerate([all_deltas_gt2, med_deltas_gt2]):
         q1, q3 = np.percentile(data, [25, 75])
         iqr = q3 - q1
         lower = q1 - 1.5 * iqr
